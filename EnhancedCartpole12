@@ -1,0 +1,286 @@
+import os
+import random
+import time
+from collections import deque
+import numpy as np
+from tensorflow.keras import Sequential
+from tensorflow.keras.layers import Dense, Input
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.losses import Huber
+from tensorflow.keras.callbacks import TensorBoard
+import gym
+
+# Original variables preserved
+ENV_NAME = "CartPole-v1"
+
+GAMMA = 0.99
+LEARNING_RATE = 1e-3
+BATCH_SIZE = 64
+MEMORY_SIZE = 100_000
+
+EXPLORATION_MAX = 1.0
+EXPLORATION_MIN = 0.01
+EXPLORATION_DECAY = 0.995
+
+TARGET_UPDATE_EVERY_EPISODES = 10
+SOFT_TAU = 0.0
+EPISODES = 500
+MAX_STEPS = 500
+RENDER = False
+REWARD_CLIP = 1.0
+SEED = 42
+CHECKPOINT_EVERY = 50
+MODEL_PATH = "cartpole_dqn.h5"
+USE_TENSORBOARD = False
+LOG_DIR = "logs/cartpole_dqn"
+
+
+# --------------------------
+# Utility Functions
+# --------------------------
+def set_global_seed(seed_value: int):
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+    try:
+        import tensorflow as tf
+        tf.random.set_seed(seed_value)
+    except Exception:
+        pass
+
+
+def unpack_reset(reset_output):
+    if isinstance(reset_output, tuple) and len(reset_output) == 2:
+        obs, _info = reset_output
+        return obs
+    return reset_output
+
+
+def unpack_step(step_output):
+    if isinstance(step_output, tuple):
+        if len(step_output) == 5:
+            obs, reward, terminated, truncated, info = step_output
+            done = terminated or truncated
+            return obs, reward, done, info
+        elif len(step_output) == 4:
+            obs, reward, done, info = step_output
+            return obs, reward, done, info
+    obs, reward, done, info = step_output
+    return obs, reward, done, info
+
+
+# --------------------------
+# Prioritized Replay Buffer
+# --------------------------
+class PrioritizedReplayBuffer:
+    def __init__(self, capacity, alpha=0.6, eps=1e-4):
+        self.capacity = capacity
+        self.buffer = deque(maxlen=capacity)
+        self.alpha = alpha
+        self.eps = eps
+
+    def __len__(self):
+        return len(self.buffer)
+
+    def add(self, transition, priority=None):
+        if priority is None:
+            max_p = max((p for p, _ in self.buffer), default=1.0)
+            priority = max_p
+        self.buffer.append((priority, transition))
+
+    def sample(self, batch_size, beta=0.4):
+        priorities = np.array([p for p, _ in self.buffer], dtype=np.float32)
+        probs = priorities ** self.alpha
+        probs /= probs.sum()
+
+        indices = np.random.choice(len(self.buffer), size=batch_size, p=probs, replace=False)
+        samples = [self.buffer[i][1] for i in indices]
+
+        total = len(self.buffer)
+        weights = (total * probs[indices]) ** (-beta)
+        weights /= weights.max()
+        return indices, samples, weights.astype(np.float32)
+
+    def update_priorities(self, indices, new_priorities):
+        for idx, p in zip(indices, new_priorities):
+            p = float(abs(p)) + self.eps
+            _, transition = self.buffer[idx]
+            self.buffer[idx] = (p, transition)
+
+
+# --------------------------
+# DQN Agent with Target Network
+# --------------------------
+class DQNSolver:
+    def __init__(self, observation_space, action_space):
+        self.obs_dim = observation_space
+        self.action_space = action_space
+
+        self.gamma = GAMMA
+        self.exploration_rate = EXPLORATION_MAX
+        self.exploration_min = EXPLORATION_MIN
+        self.exploration_decay = EXPLORATION_DECAY
+
+        self.memory = PrioritizedReplayBuffer(MEMORY_SIZE)
+
+        self.model = self._build_model()
+        self.target_model = self._build_model()
+        self.update_target_network(hard=True)
+
+        self.train_steps = 0
+
+    def _build_model(self):
+        model = Sequential([
+            Input(shape=(self.obs_dim,)),
+            Dense(128, activation="relu"),
+            Dense(128, activation="relu"),
+            Dense(self.action_space, activation="linear")
+        ])
+        model.compile(
+            optimizer=Adam(learning_rate=LEARNING_RATE, clipnorm=1.0),
+            loss=Huber()
+        )
+        return model
+
+    def update_target_network(self, hard=False, tau=SOFT_TAU):
+        if hard or tau <= 0.0:
+            self.target_model.set_weights(self.model.get_weights())
+            return
+        main_weights = self.model.get_weights()
+        target_weights = self.target_model.get_weights()
+        new_weights = [tw * (1.0 - tau) + mw * tau for tw, mw in zip(target_weights, main_weights)]
+        self.target_model.set_weights(new_weights)
+
+    def remember(self, state, action, reward, next_state, done):
+        self.memory.add((state, action, reward, next_state, done))
+
+    def act(self, state):
+        if np.random.rand() < self.exploration_rate:
+            return random.randrange(self.action_space)
+        q_values = self.model.predict(state, verbose=0)
+        return int(np.argmax(q_values[0]))
+
+    def _compute_targets(self, batch):
+        states = np.vstack([b[0] for b in batch])
+        actions = np.array([b[1] for b in batch], dtype=np.int32)
+        rewards = np.array([b[2] for b in batch], dtype=np.float32)
+        next_states = np.vstack([b[3] for b in batch])
+        dones = np.array([b[4] for b in batch], dtype=np.bool_)
+
+        q_current = self.model.predict(states, verbose=0)
+        q_next_target = self.target_model.predict(next_states, verbose=0)
+        q_next_max = np.max(q_next_target, axis=1)
+
+        q_targets = q_current.copy()
+        bellman = rewards + (1.0 - dones.astype(np.float32)) * self.gamma * q_next_max
+
+        td_errors = bellman - q_current[np.arange(len(batch)), actions]
+        q_targets[np.arange(len(batch)), actions] = bellman
+
+        return states, q_targets, td_errors
+
+    def experience_replay(self):
+        if len(self.memory) < BATCH_SIZE:
+            return
+
+        indices, samples, weights = self.memory.sample(BATCH_SIZE, beta=0.4)
+        states, q_targets, td_errors = self._compute_targets(samples)
+
+        self.model.fit(states, q_targets, verbose=0, sample_weight=weights)
+        self.memory.update_priorities(indices, np.abs(td_errors))
+
+        self.exploration_rate = max(self.exploration_min, self.exploration_rate * self.exploration_decay)
+
+        if SOFT_TAU > 0.0:
+            self.update_target_network(hard=False)
+
+        self.train_steps += 1
+
+    def save(self, path=MODEL_PATH):
+        self.model.save(path)
+
+    def load(self, path=MODEL_PATH):
+        if os.path.exists(path):
+            from tensorflow.keras.models import load_model
+            loaded = load_model(path, compile=False)
+            loaded.compile(optimizer=Adam(learning_rate=LEARNING_RATE, clipnorm=1.0), loss=Huber())
+            self.model = loaded
+            self.update_target_network(hard=True)
+            print(f"Model loaded from {path}")
+        else:
+            print(f"No model found at {path}")
+
+
+# --------------------------
+# Training Loop
+# --------------------------
+def cartpole():
+    set_global_seed(SEED)
+
+    env = gym.make(ENV_NAME)
+    try:
+        env.action_space.seed(SEED)
+        env.reset(seed=SEED)
+    except TypeError:
+        pass
+
+    obs_space = env.observation_space.shape[0]
+    action_space = env.action_space.n
+    agent = DQNSolver(obs_space, action_space)
+
+    if USE_TENSORBOARD:
+        tb = TensorBoard(log_dir=LOG_DIR, update_freq='batch')
+        tb.set_model(agent.model)
+
+    best_avg = -np.inf
+    scores_window = deque(maxlen=100)
+
+    start_time = time.time()
+    for episode in range(1, EPISODES + 1):
+        obs = unpack_reset(env.reset())
+        state = np.reshape(obs, (1, obs_space))
+        total_reward = 0.0
+
+        for step in range(1, MAX_STEPS + 1):
+            if RENDER:
+                env.render()
+
+            action = agent.act(state)
+            next_obs, reward, done, _ = unpack_step(env.step(action))
+            reward = float(np.clip(reward, -REWARD_CLIP, REWARD_CLIP))
+            next_state = np.reshape(next_obs, (1, obs_space))
+            agent.remember(state, action, reward, next_state, done)
+
+            state = next_state
+            total_reward += reward
+            agent.experience_replay()
+
+            if done:
+                break
+
+        scores_window.append(step)
+        avg_score = np.mean(scores_window)
+
+        if TARGET_UPDATE_EVERY_EPISODES and (episode % TARGET_UPDATE_EVERY_EPISODES == 0) and SOFT_TAU == 0.0:
+            agent.update_target_network(hard=True)
+
+        print(f"Ep {episode:04d} | Score: {step:3d} | Avg(100): {avg_score:6.2f} | Eps: {agent.exploration_rate:6.3f}")
+
+        if avg_score > best_avg and episode >= 100:
+            best_avg = avg_score
+            agent.save(MODEL_PATH)
+
+        if (episode % CHECKPOINT_EVERY) == 0:
+            agent.save(MODEL_PATH)
+
+        if episode >= 100 and avg_score >= 475.0:
+            print("Environment solved! 🎉")
+            break
+
+    env.close()
+    duration = time.time() - start_time
+    print(f"Training complete in {duration/60:.1f} min. Best avg: {best_avg:.2f}")
+    agent.save(MODEL_PATH)
+
+
+if __name__ == "__main__":
+    cartpole()
