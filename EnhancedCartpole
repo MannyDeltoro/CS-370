@@ -110,7 +110,7 @@ class PrioritizedReplayBuffer:
 # --------------------------
 # DQN Agent with Target Network
 # --------------------------
-class DQNSolver:
+class DQNAgent:
     def __init__(self, observation_space, action_space):
         self.obs_dim = observation_space
         self.action_space = action_space
